@@ -68,7 +68,7 @@ func main() {
 	config := SimulatorConfig{
 		WebSocketURL: wsURL,
 		DeviceCount:  5,
-		LogInterval:  2 * time.Second,
+		LogInterval:  30 * time.Second,
 		Duration:     0, // Run indefinitely
 	}
 
