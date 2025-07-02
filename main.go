@@ -68,7 +68,7 @@ func main() {
 	config := SimulatorConfig{
 		WebSocketURL: wsURL,
 		DeviceCount:  5,
-		LogInterval:  10 * time.Second,
+		LogInterval:  2 * time.Second,
 		Duration:     0, // Run indefinitely
 	}
 
@@ -79,12 +79,12 @@ func main() {
 	log.Printf("Simulating %d devices", config.DeviceCount)
 	log.Printf("Log interval: %v", config.LogInterval)
 
-	// Run indefinitely
+	// Run indefinitely with automatic reconnection
 	for {
 		if err := simulator.Run(); err != nil {
 			log.Printf("Simulator failed: %v", err)
-			log.Println("Restarting in 30 seconds...")
-			time.Sleep(30 * time.Second)
+			log.Println("Reconnecting in 5 seconds...")
+			time.Sleep(5 * time.Second)
 		}
 	}
 }
@@ -112,54 +112,115 @@ func generateDevices(count int) []Device {
 }
 
 func (s *LogSimulator) Run() error {
-	conn, _, err := websocket.DefaultDialer.Dial(s.config.WebSocketURL, nil)
+	// Connect with retry logic
+	conn, err := s.connectWithRetry()
 	if err != nil {
-		return fmt.Errorf("failed to connect to WebSocket: %w", err)
+		return fmt.Errorf("failed to connect after retries: %w", err)
 	}
 	defer conn.Close()
 	s.conn = conn
 
-	log.Println("Connected to WebSocket server")
+	log.Println("✅ Connected to WebSocket server")
 
 	ticker := time.NewTicker(s.config.LogInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		if err := s.sendRandomLog(); err != nil {
-			log.Printf("Error sending log: %v", err)
+	// Set up connection monitoring
+	connClosed := make(chan struct{})
+	go s.monitorConnection(conn, connClosed)
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := s.sendRandomLog(); err != nil {
+				log.Printf("Error sending log: %v", err)
+				// If it's a connection error, break out to reconnect
+				if isConnectionError(err) {
+					return fmt.Errorf("connection lost: %w", err)
+				}
+			}
+		case <-connClosed:
+			log.Println("Connection closed, reconnecting...")
+			return fmt.Errorf("connection closed by server")
+		}
+	}
+}
+
+func (s *LogSimulator) connectWithRetry() (*websocket.Conn, error) {
+	maxRetries := 5
+	retryDelay := 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("Connection attempt %d/%d...", attempt, maxRetries)
+
+		conn, _, err := websocket.DefaultDialer.Dial(s.config.WebSocketURL, nil)
+		if err == nil {
+			return conn, nil
+		}
+
+		log.Printf("Connection failed: %v", err)
+
+		if attempt < maxRetries {
+			log.Printf("Retrying in %v...", retryDelay)
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
 		}
 	}
 
-	return nil
+	return nil, fmt.Errorf("failed to connect after %d attempts", maxRetries)
+}
+
+func (s *LogSimulator) monitorConnection(conn *websocket.Conn, connClosed chan struct{}) {
+	defer close(connClosed)
+
+	// Set up ping/pong to detect connection health
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// Send periodic pings
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				log.Printf("Ping failed: %v", err)
+				return
+			}
+		}
+	}
 }
 
 func (s *LogSimulator) sendRandomLog() error {
+	if s.conn == nil {
+		return fmt.Errorf("no connection available")
+	}
+
 	device := s.devices[rand.Intn(len(s.devices))]
 	logMessage := s.generateLogMessage(device)
-
-	// Debug logging - check what's being sent
-	log.Printf("Sending log - Device: %s, Message: '%s', Message length: %d",
-		device.ID, logMessage.Message, len(logMessage.Message))
 
 	jsonData, err := json.Marshal(logMessage)
 	if err != nil {
 		return fmt.Errorf("failed to marshal log: %w", err)
 	}
 
-	// Debug logging - check the JSON
-	log.Printf("JSON data: %s", string(jsonData))
+	// Set write deadline to prevent hanging
+	s.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 	if err := s.conn.WriteMessage(websocket.TextMessage, jsonData); err != nil {
 		return fmt.Errorf("failed to send log: %w", err)
 	}
 
-	// Try to read response with a short timeout
-	s.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	// Try to read response with timeout
+	s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	// Read the first message (should be success response)
 	var response LogResponse
 	if err := s.conn.ReadJSON(&response); err != nil {
-		log.Printf("⚠️  No response (continuing): %v", err)
+		// Don't fail on read errors, just log them
+		log.Printf("⚠️  No response received: %v", err)
 		return nil
 	}
 
@@ -169,15 +230,27 @@ func (s *LogSimulator) sendRandomLog() error {
 		log.Printf("❌ Server error: %s", response.Error)
 	}
 
-	// Try to read the second message (broadcast) but don't fail if we can't
-	s.conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-	var broadcastMsg map[string]interface{}
-	if err := s.conn.ReadJSON(&broadcastMsg); err == nil {
-		// Successfully read broadcast message, ignore it
-		log.Printf(" Broadcast received (ignored)")
+	return nil
+}
+
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
 	}
 
-	return nil
+	errStr := err.Error()
+	return contains(errStr, "broken pipe") ||
+		contains(errStr, "connection reset") ||
+		contains(errStr, "use of closed network connection") ||
+		contains(errStr, "websocket: close") ||
+		contains(errStr, "i/o timeout")
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr ||
+		(len(s) > len(substr) && (s[:len(substr)] == substr ||
+			s[len(s)-len(substr):] == substr ||
+			contains(s[1:], substr))))
 }
 
 func (s *LogSimulator) generateLogMessage(device Device) LogMessage {
